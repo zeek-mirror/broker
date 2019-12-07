@@ -25,7 +25,7 @@ endif ()
 # -- Dependencies -------------------------------------------------------------
 
 if ( CAF_ROOT_DIR )
-  find_package(CAF COMPONENTS openssl test io core REQUIRED)
+  find_package(CAF COMPONENTS openssl test io core net REQUIRED)
   set(caf_dir    "${CAF_LIBRARY_CORE}")
   set(caf_config "${CAF_INCLUDE_DIR_CORE}/caf/config.hpp")
   get_filename_component(caf_dir ${caf_dir} PATH)

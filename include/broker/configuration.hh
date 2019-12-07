@@ -10,7 +10,7 @@ namespace broker {
 
 struct broker_options {
   /// If true, peer connections won't use SSL.
-  bool disable_ssl = false;
+  bool disable_ssl = true;
   /// If true, endpoints will forward incoming messages to peers.
   bool forward = true;
   /// TTL to insert into forwarded messages. Messages will be droppped once

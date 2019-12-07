@@ -8,6 +8,8 @@
 
 #include <caf/atom.hpp>
 #include <caf/io/middleman.hpp>
+#include <caf/net/all.hpp>
+#include <caf/net/backend/test.hpp>
 #include <caf/openssl/manager.hpp>
 
 #include "broker/address.hh"
@@ -32,6 +34,14 @@ configuration::configuration(broker_options opts) : options_(std::move(opts)) {
   load<caf::io::middleman>();
   if (not options_.disable_ssl)
     load<caf::openssl::manager>();
+
+  // <-
+  put(content, "middleman.this-node", *caf::make_uri("test://earth"));
+  load<caf::net::middleman, caf::net::backend::test>();
+  // ->
+
+  // put(content, "stream.credit-policy", caf::atom("size"));
+
   // Ensure that we're only talking to compatible Broker instances.
   set("middleman.app-identifier",
       "broker.v" + std::to_string(version::protocol));

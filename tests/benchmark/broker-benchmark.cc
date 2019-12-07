@@ -13,6 +13,11 @@
 
 #include <caf/deep_to_string.hpp>
 #include <caf/downstream.hpp>
+#include <caf/io/all.hpp>
+#include <caf/io/network/default_multiplexer.hpp>
+#include <caf/io/network/scribe_impl.hpp>
+#include <caf/net/all.hpp>
+#include <caf/net/backend/test.hpp>
 
 #include "broker/configuration.hh"
 #include "broker/convert.hh"
@@ -26,6 +31,11 @@
 
 using namespace broker;
 
+namespace io = caf::io;
+namespace net = caf::net;
+
+using caf::make_counted;
+
 namespace {
 
 int event_type = 1;
@@ -35,7 +45,6 @@ double rate_increase_interval = 0;
 double rate_increase_amount = 0;
 uint64_t max_received = 0;
 uint64_t max_in_flight = 0;
-bool server = false;
 bool verbose = false;
 
 // Global state
@@ -212,7 +221,7 @@ void receivedStats(endpoint& ep, data x) {
     max_exceeded_counter = 0;
 }
 
-void client_mode(endpoint& ep, const std::string& host, int port) {
+void client_mode(endpoint& ep) {
   // Make sure to receive status updates.
   auto ss = ep.make_status_subscriber(true);
   // Subscribe to /benchmark/stats to print server updates.
@@ -228,17 +237,6 @@ void client_mode(endpoint& ep, const std::string& host, int port) {
     [](caf::unit_t&, const caf::error&) {
       // nop
     });
-  // Publish events to /benchmark/events.
-  // Connect to remote peer.
-  if (verbose)
-    std::cout << "*** init peering: host = " << host << ", port = " << port
-              << std::endl;
-  auto res = ep.peer(host, port, timeout::seconds(1));
-  if (!res) {
-    std::cerr << "unable to peer to " << host << " on port " << port
-              << std::endl;
-    return;
-  }
   if (verbose)
     std::cout << "*** endpoint is now peering to remote" << std::endl;
   if (batch_rate == 0) {
@@ -297,7 +295,7 @@ void client_mode(endpoint& ep, const std::string& host, int port) {
 }
 
 // This mode mimics what benchmark.bro does.
-void server_mode(endpoint& ep, const std::string& iface, int port) {
+void server_mode(endpoint& ep) {
   // Make sure to receive status updates.
   auto ss = ep.make_status_subscriber(true);
   // Subscribe to /benchmark/events.
@@ -336,8 +334,6 @@ void server_mode(endpoint& ep, const std::string& iface, int port) {
     [](caf::unit_t&, const caf::error&) {
       // nop
     });
-  // Start listening for peers.
-  ep.listen(iface, port);
   // Collects stats once per second until receiving stop message.
   using std::chrono::duration_cast;
   timestamp timeout = std::chrono::system_clock::now();
@@ -366,6 +362,7 @@ void server_mode(endpoint& ep, const std::string& iface, int port) {
 struct config : configuration {
   config(){
     opt_group{custom_options_, "global"}
+      .add<bool>("io-mode", "")
       .add(event_type, "event-type,t",
            "1 (vector, default) | 2 (conn log entry) | 3 (table)")
       .add(batch_rate, "batch-rate,r",
@@ -377,7 +374,6 @@ struct config : configuration {
            "additional batch size per interval")
       .add(max_received, "max-received,m", "stop benchmark after given count")
       .add(max_in_flight, "max-in-flight,f", "report when exceeding this count")
-      .add(server, "server", "run in server mode")
       .add(verbose, "verbose", "enable status output");
   }
 
@@ -393,6 +389,75 @@ void usage(const config& cfg, const char* cmd_name) {
             << cfg.help_text();
 }
 
+std::mutex ready_mx;
+std::condition_variable ready_cv;
+std::atomic<bool> ready;
+
+void io_run(caf::net::stream_socket first, caf::net::stream_socket second) {
+  using io::network::scribe_impl;
+  configuration conf;
+  caf::put(conf.content, "middleman.this-node", *caf::make_uri("test://mars"));
+  endpoint ep{std::move(conf)};
+  auto& sys = ep.system();
+  auto& mm = sys.middleman();
+  auto& mpx = dynamic_cast<io::network::default_multiplexer&>(mm.backend());
+  io::scribe_ptr scribe = make_counted<scribe_impl>(mpx, second.id);
+  auto bb = mm.named_broker<io::basp_broker>(caf::atom("BASP"));
+  caf::scoped_actor self{sys};
+  caf::actor remote_core;
+  self
+    ->request(bb, caf::infinite, caf::connect_atom::value, std::move(scribe),
+              uint16_t{8080})
+    .receive(
+      [&](node_id& nid, caf::strong_actor_ptr& ptr, std::set<std::string>& xs) {
+        std::cout << "connected to node " << to_string(nid) << "\n";
+        if (ptr == nullptr) {
+          std::cerr << "ERROR: could not get a handle to remote source\n";
+          abort();
+        }
+        remote_core = caf::actor_cast<caf::actor>(ptr);
+      },
+      [&](caf::error& err) {
+        std::cerr << "ERROR: " << sys.render(err) << std::endl;
+        abort();
+      });
+  caf::anon_send(ep.core(), atom::peer::value, remote_core);
+  {
+    std::unique_lock guard{ready_mx};
+    ready = true;
+    ready_cv.notify_all();
+  }
+  client_mode(ep);
+}
+
+void net_run(caf::net::stream_socket first, caf::net::stream_socket second) {
+  auto mars_id =  *caf::make_uri("test://mars");
+  auto earth_id = *caf::make_uri("test://earth");
+  configuration conf;
+  caf::put(conf.content, "middleman.this-node", mars_id);
+  endpoint ep{std::move(conf)};
+  auto& sys = ep.system();
+  auto& mm = sys.network_manager();
+  auto& backend = *dynamic_cast<net::backend::test*>(mm.backend("test"));
+  backend.emplace(make_node_id(earth_id), second, first);
+  auto locator = *caf::make_uri("test://earth/name/core");
+  caf::scoped_actor self{sys};
+  puts("resolve locator");
+  mm.resolve(locator, self);
+  caf::actor remote_core;
+  self->receive([&](caf::strong_actor_ptr& ptr, const std::set<std::string>&) {
+    printf("got remote core: %s -> run\n", to_string(ptr).c_str());
+    remote_core = caf::actor_cast<caf::actor>(ptr);
+  });
+  caf::anon_send(ep.core(), atom::peer::value, remote_core);
+  {
+    std::unique_lock guard{ready_mx};
+    ready = true;
+    ready_cv.notify_all();
+  }
+  client_mode(ep);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -404,6 +469,65 @@ int main(int argc, char** argv) {
   }
   if (cfg.cli_helptext_printed)
     return EXIT_SUCCESS;
+
+  if (caf::get_or(cfg, "io-mode", false)) {
+     puts("run in 'ioBench' mode");
+     auto sockets = *net::make_stream_socket_pair();
+     printf("sockets: %d, %d\n", sockets.first.id, sockets.second.id);
+     endpoint ep;
+     auto& sys = ep.system();
+     using io::network::scribe_impl;
+     auto& mm = sys.middleman();
+     auto& mpx = dynamic_cast<io::network::default_multiplexer&>(mm.backend());
+     io::scribe_ptr scribe = make_counted<scribe_impl>(mpx, sockets.first.id);
+     auto bb = mm.named_broker<io::basp_broker>(caf::atom("BASP"));
+     caf::scoped_actor self{sys};
+     if (ep.core() == nullptr) {
+       std::cerr << "ep.core() == nullptr\n";
+       abort();
+     }
+     self
+       ->request(bb, caf::infinite, caf::publish_atom::value, std::move(scribe),
+                 uint16_t{8080},
+                 caf::actor_cast<caf::strong_actor_ptr>(ep.core()),
+                 std::set<std::string>{})
+       .receive([] { std::cout << "published core at port 8080\n"; },
+                [&](caf::error& err) {
+                  std::cerr << "ERROR: " << sys.render(err) << std::endl;
+                  abort();
+                });
+     std::thread client_thread{[sockets] {
+       io_run(sockets.first, sockets.second);
+     }};
+     {
+       std::unique_lock guard{ready_mx};
+       ready_cv.wait(guard, [] { return ready.load(); });
+     }
+     server_mode(ep);
+     client_thread.join();
+  } else {
+    auto mars_id = *caf::make_uri("test://mars");
+    puts("run in 'netBench' mode");
+    auto sockets = *net::make_stream_socket_pair();
+    printf("sockets: %d, %d\n", sockets.first.id, sockets.second.id);
+    endpoint ep;
+    auto& sys = ep.system();
+    sys.registry().put(caf::atom("core"), ep.core());
+    auto& mm = sys.network_manager();
+    auto& backend = *dynamic_cast<net::backend::test*>(mm.backend("test"));
+    backend.emplace(make_node_id(mars_id), sockets.first, sockets.second);
+    puts("spin up second endpoint");
+    std::thread client_thread{
+      [sockets] { net_run(sockets.first, sockets.second); }};
+    {
+      std::unique_lock guard{ready_mx};
+      ready_cv.wait(guard, [] { return ready.load(); });
+    }
+    server_mode(ep);
+    client_thread.join();
+  }
+
+  /*
   if (cfg.remainder.size() != 1) {
     std::cerr << "*** too many arguments\n\n";
     usage(cfg, argv[0]);
@@ -439,4 +563,5 @@ int main(int argc, char** argv) {
   else
     client_mode(ep, host, port);
   return EXIT_SUCCESS;
+  */
 }

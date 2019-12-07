@@ -190,8 +190,8 @@ endpoint::endpoint(configuration config)
   // Initialize remaining state.
   new (&system_) caf::actor_system(config_);
   clock_ = new clock(&system_, config_.options().use_real_time);
-  if (( !config_.options().disable_ssl) && !system_.has_openssl_manager())
-      detail::die("CAF OpenSSL manager is not available");
+  //if (( !config_.options().disable_ssl) && !system_.has_openssl_manager())
+  //    detail::die("CAF OpenSSL manager is not available");
   BROKER_INFO("creating endpoint");
   core_ = system_.spawn(core_actor, filter_type{}, config_.options(), clock_);
 }
